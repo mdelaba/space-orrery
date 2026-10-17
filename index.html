@@ -1,0 +1,814 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Orrery 4K</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+  html,body{margin:0;height:100%;background:#000;overflow:hidden;cursor:none}
+  canvas{position:fixed;inset:0;width:100%;height:100%;display:block}
+  #hud{position:fixed;left:32px;bottom:26px;font:12px/1.9 ui-monospace,"JetBrains Mono",monospace;letter-spacing:.24em;
+       color:#a9bfe6;opacity:.55;text-transform:uppercase;pointer-events:none;white-space:pre;text-shadow:0 0 12px rgba(120,160,255,.45);transition:opacity .6s}
+  #hud b{font-weight:500;color:#e8f0ff;letter-spacing:.32em}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="hud"></div>
+<script>
+(() => {
+'use strict';
+const cv = document.getElementById('c'), hud = document.getElementById('hud');
+const fail = m => { window.__err = (window.__err || '') + m + '\n'; hud.textContent = 'error: ' + m.slice(0, 400); };
+window.onerror = (m, s, l) => fail(m + ' @' + l);
+
+const gl = cv.getContext('webgl2', { antialias: false, alpha: false, powerPreference: 'high-performance' });
+if (!gl) { fail('WebGL2 unavailable'); return; }
+const HDR = !!gl.getExtension('EXT_color_buffer_float');
+gl.getExtension('OES_texture_float_linear');
+const IFMT = HDR ? gl.RGBA16F : gl.RGBA8, ITYP = HDR ? gl.HALF_FLOAT : gl.UNSIGNED_BYTE;
+
+const TAU = Math.PI * 2;
+const clamp = (v, a = 0, b = 1) => Math.max(a, Math.min(b, v));
+const sm = t => t * t * (3 - 2 * t);
+const mix = (a, b, t) => a + (b - a) * t;
+const mixc = (a, b, t) => [mix(a[0], b[0], t), mix(a[1], b[1], t), mix(a[2], b[2], t)];
+function mb(a) { return () => { a |= 0; a = a + 0x6D2B79F5 | 0; let t = Math.imul(a ^ a >>> 15, 1 | a); t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; }; }
+function hsl(h, s, l) {
+  h = ((h % 360) + 360) % 360 / 360;
+  const f = n => { const k = (n + h * 12) % 12, a = s * Math.min(l, 1 - l); return (l - a * Math.max(-1, Math.min(k - 3, 9 - k, 1))); };
+  return [f(0), f(8), f(4)];
+}
+const lin = c => c.map(v => Math.pow(clamp(v), 2.2));
+
+/* =====================================================================
+   GLSL
+   ===================================================================== */
+const HEAD = '#version 300 es\nprecision highp float;\n';
+const NOISE = `
+float hash13(vec3 p){p=fract(p*.1031);p+=dot(p,p.zyx+31.32);return fract((p.x+p.y)*p.z);}
+float hash21(vec2 p){p=fract(p*vec2(123.34,456.21));p+=dot(p,p+45.32);return fract(p.x*p.y);}
+float vnoise(vec3 p){vec3 i=floor(p),f=fract(p);f=f*f*(3.-2.*f);
+ return mix(mix(mix(hash13(i),hash13(i+vec3(1,0,0)),f.x),mix(hash13(i+vec3(0,1,0)),hash13(i+vec3(1,1,0)),f.x),f.y),
+            mix(mix(hash13(i+vec3(0,0,1)),hash13(i+vec3(1,0,1)),f.x),mix(hash13(i+vec3(0,1,1)),hash13(i+vec3(1,1,1)),f.x),f.y),f.z);}
+float fbm(vec3 p,int o){float a=.5,s=0.;for(int i=0;i<8;i++){if(i>=o)break;s+=a*vnoise(p);p=p*2.03+17.1;a*=.5;}return s;}
+vec3 rotY(vec3 p,float a){float c=cos(a),s=sin(a);return vec3(c*p.x+s*p.z,p.y,-s*p.x+c*p.z);}
+`;
+
+const VS_FULL = HEAD + `layout(location=0) in vec2 a; out vec2 v; void main(){v=a*.5+.5; gl_Position=vec4(a,0.,1.);}`;
+
+const VS_BODY = HEAD + `layout(location=0) in vec2 a; uniform vec2 u_res,u_c; uniform float u_ext,u_rad; out vec2 uv;
+void main(){uv=a*u_ext; vec2 px=u_c+a*u_ext*u_rad; gl_Position=vec4(px/u_res*2.-1.,0.,1.);}`;
+
+/* ---- nebula bake (equirect-ish cylinder, seamless in x) ---- */
+const FS_NEB = HEAD + NOISE + `in vec2 v; out vec4 o; uniform vec3 u_h1,u_h2,u_h3; uniform float u_seed;
+void main(){
+ float a=v.x*6.2831853; vec3 p=vec3(cos(a)*1.6,sin(a)*1.6,v.y*5.)+u_seed;
+ vec3 q=vec3(fbm(p*.9,5),fbm(p*.9+vec3(5.2,1.3,8.1),5),fbm(p*.9+vec3(2.7,9.2,4.4),5));
+ float n=fbm(p*1.1+q*2.2,7);
+ float d=smoothstep(.44,.84,n);
+ float dust=smoothstep(.45,.78,fbm(p*1.9+q*3.+11.,6));
+ vec3 col=mix(u_h1,u_h2,smoothstep(.3,.7,q.x)); col=mix(col,u_h3,smoothstep(.55,.9,q.z)*.7);
+ col=mix(vec3(dot(col,vec3(.33))),col,.62);
+ float glow=d*d*(1.-.75*dust);
+ float knot=pow(smoothstep(.66,.92,n),3.);
+ vec3 c=col*glow*.22+col*knot*.38+mix(u_h1,u_h2,.5)*.006;
+ c*=1.-.6*dust*smoothstep(.2,.6,n);
+ o=vec4(c,1.);
+}`;
+
+/* ---- background: nebula + procedural stars ---- */
+const FS_BG = HEAD + NOISE + `in vec2 v; out vec4 o; uniform sampler2D u_neb; uniform vec2 u_res,u_off; uniform vec4 u_sky; uniform float u_time,u_unit,u_nebI,u_band;
+vec3 stars(vec2 fc,float cell,float prob,float sig,vec2 off,float sd,float dens){
+ vec2 p=(fc+off)/cell; vec2 id=floor(p),f=fract(p);
+ float h=hash21(id+sd); if(h>prob*dens) return vec3(0.);
+ vec2 sp=.2+.6*vec2(hash21(id*1.7+sd+3.1),hash21(id*2.3+sd+7.7));
+ float d=length((f-sp)*cell);
+ float mag=pow(hash21(id*3.1+sd+11.3),7.)*1.6+.02;
+ float tw=.92+.08*sin(u_time*(1.+3.*h)+h*60.);
+ float I=mag*tw*exp(-d*d/(2.*sig*sig));
+ float tc=hash21(id*5.3+sd);
+ vec3 col=mix(vec3(.62,.76,1.),vec3(1.,.8,.58),tc); col=mix(col,vec3(1.),.3);
+ return col*I*2.2;
+}
+void main(){
+ vec2 asp=vec2(u_res.x/u_res.y,1.);
+ vec2 c=(v-.5)*asp; float cr=cos(u_sky.w),sr=sin(u_sky.w); c=vec2(cr*c.x-sr*c.y,sr*c.x+cr*c.y);
+ vec2 su=vec2(u_sky.x+c.x*u_sky.z/10.,u_sky.y+c.y*u_sky.z/5.);
+ vec3 neb=texture(u_neb,su).rgb*u_nebI;
+ float bd=(v.x-.5)*cos(u_band)+(v.y-.5)*sin(u_band);
+ float dens=.55+2.2*exp(-bd*bd*14.);
+ float sig=.72*u_unit; vec2 fc=gl_FragCoord.xy;
+ vec3 s=stars(fc,34.*u_unit,.30,sig,u_off*.12,1.3,dens)+stars(fc,70.*u_unit,.22,sig,u_off*.32,5.7,dens)+stars(fc,150.*u_unit,.34,sig*1.1,u_off*.7,9.1,dens);
+ neb*=1.+.6*exp(-bd*bd*10.);
+ o=vec4(neb+s,1.);
+}`;
+
+/* ---- planets / moons ---- */
+const FS_PLANET = HEAD + NOISE + `in vec2 uv; out vec4 o;
+uniform int u_kind; uniform vec3 u_seed,u_c1,u_c2,u_c3,u_axis; uniform mat3 u_rotT;
+uniform vec3 u_L[2]; uniform vec3 u_C[2];
+uniform float u_ring,u_ringIn,u_time,u_heat,u_cloud;
+
+float crater(vec3 p){
+ vec3 i=floor(p),f=fract(p); float res=0.;
+ for(int z=-1;z<=1;z++)for(int y=-1;y<=1;y++)for(int x=-1;x<=1;x++){
+  vec3 g=vec3(float(x),float(y),float(z)); vec3 id=i+g;
+  float h=hash13(id+7.7); if(h<.45) continue;
+  vec3 oo=vec3(hash13(id),hash13(id+13.1),hash13(id+27.7));
+  float rad=.14+.3*hash13(id+3.3);
+  float d=length(g+oo-f)/rad;
+  res+=(smoothstep(1.,0.,d)*-.8+smoothstep(.16,0.,abs(d-1.05))*.5)*(1.-.3*h);
+ }
+ return res;
+}
+float ringDensity(float rho){
+ float t=(rho-u_ringIn)/(u_ring-u_ringIn);
+ if(t<0.||t>1.) return 0.;
+ float b=vnoise(vec3(rho*55.,u_seed.x,0.))*.6+vnoise(vec3(rho*150.,u_seed.y,3.))*.4;
+ float gap=smoothstep(0.,.05,abs(t-.62)-.04)*.85+.15;
+ float edge=smoothstep(0.,.05,t)*smoothstep(1.,.93,t);
+ return clamp((.3+.9*b)*gap*edge*(.7+.3*smoothstep(.25,.4,t)),0.,1.);
+}
+float ringShadow(vec3 n,vec3 L){
+ if(u_ring<=0.) return 1.;
+ vec3 nr=normalize(u_axis); float dl=dot(L,nr); if(abs(dl)<.02) return 1.;
+ float s=-dot(n,nr)/dl; if(s<=0.) return 1.;
+ return 1.-ringDensity(length(n+s*L))*.92;
+}
+vec3 atmoColor(){ return u_kind==1?vec3(.22,.48,1.):(u_kind==2?vec3(.55,.45,.32):(u_kind==3?vec3(.3,.78,1.):vec3(0.))); }
+
+void main(){
+ float r2=dot(uv,uv), r=sqrt(r2), pw=fwidth(r)+1e-4;
+ bool inD=r<1.+pw;
+ vec3 alb=vec3(0.),emis=vec3(0.),n=vec3(0.,0.,1.); float z=0.,hgt=0.,spec=0.,bumpK=0.,cl=0.,lights=0.;
+ if(inD){
+  vec2 uc=uv/max(r,1.); z=sqrt(max(1.-dot(uc,uc),0.)); n=vec3(uc,z); vec3 p=u_rotT*n;
+  if(u_kind==0){
+   float h=fbm(p*2.5+u_seed,6);
+   float rid=1.-abs(fbm(p*5.+u_seed*1.7,5)*2.-1.);
+   hgt=h*.5+crater(p*6.+u_seed)*.4+rid*.15;
+   alb=mix(u_c1,u_c2,smoothstep(.3,.75,h));
+   alb*=.72+.55*smoothstep(.35,.65,fbm(p*16.+u_seed,4));
+   alb=mix(alb,u_c3,smoothstep(.55,.85,rid)*.45);
+   alb*=.85+.3*smoothstep(-.3,.3,hgt-.5);
+   bumpK=.016;
+  } else if(u_kind==1){
+   float h=fbm(p*2.2+u_seed,7); float sea=.5;
+   float land=smoothstep(sea,sea+.012,h); float lat=abs(p.y);
+   float ice=smoothstep(.78,.9,lat+(h-.5)*.35);
+   float temp=1.-lat+(fbm(p*4.+u_seed*3.,4)-.5)*.5;
+   vec3 landc=mix(u_c2,u_c3,smoothstep(.35,.7,temp+(fbm(p*7.+u_seed,4)-.5)*.5));
+   float elev=(h-sea)*4.;
+   landc=mix(landc,vec3(.25,.22,.19),smoothstep(.5,1.,elev)); landc=mix(landc,vec3(.9),smoothstep(.95,1.5,elev+lat*.6));
+   vec3 seac=mix(vec3(.003,.014,.05),u_c1,smoothstep(sea-.05,sea,h));
+   alb=mix(seac,landc,land); alb=mix(alb,vec3(.88,.92,.97),ice);
+   spec=(1.-land)*(1.-ice)*1.6; hgt=max(h-sea,0.)*1.6; bumpK=.01;
+   vec3 pc=rotY(p,u_cloud*3.); vec3 cp=pc*3.1+u_seed*2.;
+   cl=smoothstep(.52,.8,fbm(cp+fbm(cp*2.,2)*.8,5))*.88;
+   alb=mix(alb,vec3(.93),cl); spec*=(1.-cl); hgt=mix(hgt,0.,cl*.8);
+   lights=land*(1.-ice)*smoothstep(.6,.66,fbm(p*30.+u_seed,3))*smoothstep(.42,.58,fbm(p*4.5+u_seed,3))*(1.-cl);
+  } else if(u_kind==2){
+   float lat=p.y; float a=u_cloud*6.*(.7+.5*sin(lat*6.+u_seed.x));
+   vec3 pr=rotY(p,a);
+   float warp=fbm(vec3(pr.x*3.,pr.y*10.,pr.z*3.)+u_seed,5);
+   float band=vnoise(vec3(0.,lat*7.+warp*.9,u_seed.z))*.55+vnoise(vec3(0.,lat*17.+warp*1.6,u_seed.y))*.3+vnoise(vec3(0.,lat*40.+warp*2.,u_seed.x))*.15;
+   band=clamp(band*1.25-.12,0.,1.);
+   float turb=fbm(pr*vec3(6.,22.,6.)+warp*2.5+u_seed,5);
+   alb=mix(u_c1,u_c2,smoothstep(.25,.7,band));
+   alb=mix(alb,u_c3,smoothstep(.55,.9,band*.6+turb*.6)*.8);
+   alb*=.74+.5*turb;
+   float lon=atan(p.z,p.x),l0=u_seed.x*3.,dl=atan(sin(lon-l0),cos(lon-l0)),la=lat+.32;
+   float storm=exp(-(dl*dl*1.6+la*la/.012));
+   float swirl=fbm(vec3(dl*6.+la*14.,la*30.-dl*6.,u_seed.y),4);
+   alb=mix(alb,mix(vec3(.75,.32,.16),vec3(.95,.7,.5),swirl),storm*.85);
+   alb*=.55+.45*pow(z,.5);
+  } else {
+   float lat=p.y; float warp=fbm(vec3(p.x*2.,lat*6.,p.z*2.)+u_seed+u_cloud,4);
+   float band=vnoise(vec3(0.,lat*4.+warp*.8,u_seed.x))*.6+vnoise(vec3(0.,lat*11.+warp,u_seed.y))*.4;
+   alb=mix(u_c1,u_c2,smoothstep(.3,.75,band));
+   float streak=smoothstep(.55,.75,fbm(vec3(p.x*2.,lat*26.,p.z*2.)+u_seed*2.,4));
+   alb=mix(alb,u_c3,streak*.35); alb*=.8+.3*warp;
+  }
+  if(u_heat>0.){
+   float hh=smoothstep(.42,.72,fbm(p*6.+u_time*.03+u_seed,4));
+   emis+=u_heat*(.25+hh*1.5)*vec3(1.,.32,.07)*2.2;
+  }
+ }
+ vec2 g=clamp(vec2(dFdx(hgt),dFdy(hgt))/(fwidth(uv.x)+1e-5),-8.,8.);
+ vec4 pl=vec4(0.);
+ if(inD){
+  float pa=1.-smoothstep(1.-pw,1.+pw,r);
+  vec3 nn=normalize(n-vec3(g*bumpK,0.));
+  vec3 col=alb*vec3(.004,.006,.012);
+  vec3 atmo=vec3(0.); float lit=0.; float f=pow(1.-z,3.);
+  vec3 ac=atmoColor();
+  float atK=u_kind==1?1.5:(u_kind==2?.55:(u_kind==3?1.3:0.));
+  for(int i=0;i<2;i++){
+   vec3 L=u_L[i]; float ndl=dot(nn,L), ndg=dot(n,L);
+   float sh=ringShadow(n,L);
+   float d=clamp((ndl+.05)/1.05,0.,1.); d=d*d*(3.-2.*d)*.3+d*.7;
+   if(u_kind>=2) d=clamp((ndg+.2)/1.2,0.,1.);
+   col+=alb*u_C[i]*d*sh;
+   lit+=d*sh*dot(u_C[i],vec3(.33));
+   vec3 Hh=normalize(L+vec3(0.,0.,1.)); col+=u_C[i]*pow(max(dot(nn,Hh),0.),170.)*spec*sh;
+   float sc=smoothstep(-.35,.45,ndg); float tw=1.-smoothstep(0.,.3,ndg);
+   atmo+=mix(ac,vec3(1.,.45,.2)*.8,tw*.6)*u_C[i]*sc*f*atK;
+  }
+  emis+=lights*(1.-smoothstep(0.,.18,lit))*vec3(1.,.72,.38)*1.7;
+  col+=atmo+emis;
+  pl=vec4(col*pa,pa);
+ }
+ vec3 outc=pl.rgb; float outa=pl.a;
+ /* ring */
+ if(u_ring>0.){
+  vec3 nr=normalize(u_axis);
+  if(abs(nr.z)>.02){
+   float zz=-(uv.x*nr.x+uv.y*nr.y)/nr.z; vec3 P=vec3(uv,zz); float rho=length(P);
+   float dn=ringDensity(rho);
+   if(dn>0.){
+    vec3 rc=vec3(0.);
+    vec3 ralb=mix(vec3(.62,.52,.4),vec3(.4,.33,.27),vnoise(vec3(rho*30.,u_seed.z,1.)));
+    for(int i=0;i<2;i++){
+     vec3 L=u_L[i]; float sd=dot(P,L); float lit=1.;
+     if(sd<0.&&length(P-sd*L)<1.) lit=0.;
+     rc+=ralb*u_C[i]*lit*(.3+.7*abs(dot(nr,L)));
+    }
+    float ra=dn*.92;
+    bool front=!inD||zz>z;
+    if(front){ outc=rc*ra+outc*(1.-ra); outa=ra+outa*(1.-ra); }
+    else { outc=outc+rc*ra*(1.-outa); outa=outa+ra*(1.-outa); }
+   }
+  }
+ }
+ /* atmosphere halo */
+ if(u_kind>=1&&r>=1.-pw&&r<1.4){
+  vec3 ac=atmoColor(); float hh=exp(-(r-1.)*(u_kind==2?26.:36.))*(u_kind==2?.3:1.); vec2 d2=uv/max(r,1e-3);
+  for(int i=0;i<2;i++){ outc+=ac*u_C[i]*hh*smoothstep(-.1,.8,dot(d2,normalize(u_L[i].xy+1e-4)))*(1.-.6*abs(u_L[i].z))*.9; }
+ }
+ o=vec4(outc,outa);
+}`;
+
+/* ---- star disc ---- */
+const FS_STAR = HEAD + NOISE + `in vec2 uv; out vec4 o; uniform vec3 u_col,u_seed; uniform float u_int,u_time,u_swell;
+void main(){
+ float r2=dot(uv,uv),r=sqrt(r2),pw=fwidth(r)+1e-4;
+ vec2 uc=uv/max(r,1.); float z=sqrt(max(1.-dot(uc,uc),0.)); vec3 n=vec3(uc,z);
+ vec3 p=rotY(n,u_time*.05);
+ float sc=mix(13.,3.,u_swell);
+ float g=fbm(p*sc+vec3(0.,0.,u_time*(.12-.08*u_swell))+u_seed,5);
+ float g2=fbm(p*sc*2.7-u_time*.1+u_seed,4);
+ float cells=smoothstep(.3,.78,g*.7+g2*.3);
+ float spots=smoothstep(.6,.7,fbm(p*3.+u_seed*2.,4))*.5;
+ float mu=z; float limb=1.-.65*(1.-mu)-.12*(1.-mu)*(1.-mu);
+ vec3 hot=mix(u_col,vec3(1.),.45), cool=u_col*mix(.55,.22,u_swell);
+ vec3 c=mix(cool,hot,cells)*(1.-spots*.75)*limb*u_int;
+ float a=1.-smoothstep(1.-pw,1.+pw,r);
+ o=vec4(c*a,a);
+}`;
+const FS_HALO = HEAD + NOISE + `in vec2 uv; out vec4 o; uniform vec3 u_col,u_seed; uniform float u_int,u_time,u_ext;
+void main(){
+ float r=length(uv); float rr=max(r,1.); float ang=atan(uv.y,uv.x);
+ float rays=.6+.4*vnoise(vec3(cos(ang)*2.5,sin(ang)*2.5,u_time*.04+u_seed.x));
+ float g=exp(-(rr-1.)*3.4)*.8+.2/(rr*rr)+.035/rr;
+ float streak=exp(-abs(uv.y)*16.)*exp(-abs(uv.x)*.16)*.16;
+ float edge=1.-smoothstep(u_ext*.45,u_ext,r);
+ o=vec4(u_col*(g*rays+streak)*u_int*.45*edge,0.);
+}`;
+const FS_BEAM = HEAD + `in vec2 uv; out vec4 o; uniform float u_ang,u_int; uniform vec3 u_col;
+void main(){
+ float c=cos(u_ang),s=sin(u_ang); vec2 p=vec2(c*uv.x+s*uv.y,-s*uv.x+c*uv.y);
+ float ax=abs(p.x); float w=.012+.035*ax;
+ float I=exp(-p.y*p.y/(w*w))*exp(-ax*.6)*smoothstep(.0,.5,ax);
+ float edge=1.-smoothstep(10.,14.,length(uv));
+ o=vec4(u_col*I*u_int*edge,0.);
+}`;
+const FS_SHOCK = HEAD + NOISE + `in vec2 uv; out vec4 o; uniform float u_fade,u_time; uniform vec3 u_seed;
+void main(){
+ float r=length(uv); if(r>1.12){o=vec4(0.);return;}
+ vec3 d=vec3(uv,sqrt(max(1.-min(r,1.)*min(r,1.),0.)));
+ float f=fbm(d*5.+u_seed+u_time*.02,4), f2=fbm(d*14.+u_seed*2.,3);
+ float sh=exp(-pow((r-.955)/(.03+.03*(1.-u_fade)),2.));
+ sh*=(.3+1.5*smoothstep(.35,.75,f))*(.55+.9*f2);
+ float inner=smoothstep(1.,.15,r)*.06*(.4+f);
+ float lead=exp(-pow((r-.985)/.007,2.))*1.4;
+ vec3 hue=mix(vec3(.12,.55,1.),vec3(1.,.26,.1),smoothstep(.3,.7,f2+(1.-r)*.4));
+ o=vec4((hue*(sh*3.2+inner*2.)+vec3(.8,.9,1.)*lead)*u_fade,0.);
+}`;
+
+/* ---- ribbons & points ---- */
+const VS_TRAIL = HEAD + `layout(location=0) in vec4 a; layout(location=1) in vec3 c; uniform vec2 u_res; out float e; out float al; out vec3 col;
+void main(){e=a.z;al=a.w;col=c;gl_Position=vec4(a.xy/u_res*2.-1.,0.,1.);}`;
+const FS_TRAIL = HEAD + `in float e; in float al; in vec3 col; out vec4 o; void main(){float s=1.-abs(e); float a=al*s*s; o=vec4(col*a,0.);}`;
+const VS_PT = HEAD + `layout(location=0) in vec3 a; layout(location=1) in vec4 c; uniform vec2 u_res; out vec4 col;
+void main(){col=c;gl_PointSize=a.z;gl_Position=vec4(a.xy/u_res*2.-1.,0.,1.);}`;
+const FS_PT = HEAD + `in vec4 col; out vec4 o; void main(){float d=length(gl_PointCoord-.5)*2.; float f=exp(-d*d*3.2)*(1.-smoothstep(.8,1.,d)); o=vec4(col.rgb*col.a*f,0.);}`;
+
+/* ---- post ---- */
+const FS_DOWN = HEAD + `in vec2 v; out vec4 o; uniform sampler2D u_t; uniform vec2 u_texel; uniform int u_first;
+vec3 s(vec2 uv){return texture(u_t,uv).rgb;}
+void main(){
+ vec2 t=u_texel;
+ vec3 a=s(v+t*vec2(-2,-2)),b=s(v+t*vec2(0,-2)),c=s(v+t*vec2(2,-2)),d=s(v+t*vec2(-2,0)),e=s(v),f=s(v+t*vec2(2,0)),g=s(v+t*vec2(-2,2)),h=s(v+t*vec2(0,2)),i=s(v+t*vec2(2,2)),
+      j=s(v+t*vec2(-1,-1)),k=s(v+t*vec2(1,-1)),l=s(v+t*vec2(-1,1)),m=s(v+t*vec2(1,1));
+ vec3 col=e*.125+(a+c+g+i)*.03125+(b+d+f+h)*.0625+(j+k+l+m)*.125;
+ if(u_first==1){float br=max(col.r,max(col.g,col.b)); col*=smoothstep(.95,2.8,br);}
+ o=vec4(col,1.);
+}`;
+const FS_UP = HEAD + `in vec2 v; out vec4 o; uniform sampler2D u_t; uniform vec2 u_texel; uniform float u_w;
+void main(){
+ vec3 c=texture(u_t,v).rgb*4.;
+ c+=texture(u_t,v+u_texel*vec2(-1,0)).rgb*2.+texture(u_t,v+u_texel*vec2(1,0)).rgb*2.+texture(u_t,v+u_texel*vec2(0,-1)).rgb*2.+texture(u_t,v+u_texel*vec2(0,1)).rgb*2.;
+ c+=texture(u_t,v+u_texel*vec2(-1,-1)).rgb+texture(u_t,v+u_texel*vec2(1,-1)).rgb+texture(u_t,v+u_texel*vec2(-1,1)).rgb+texture(u_t,v+u_texel*vec2(1,1)).rgb;
+ o=vec4(c/16.*u_w,1.);
+}`;
+const FS_COMP = HEAD + `in vec2 v; out vec4 o; uniform sampler2D u_scene,u_bloom; uniform float u_bloomI,u_fade,u_flash,u_time,u_exp;
+float hash(vec2 p){p=fract(p*vec2(443.897,441.423));p+=dot(p,p+19.19);return fract(p.x*p.y);}
+vec3 aces(vec3 x){return clamp((x*(2.51*x+.03))/(x*(2.43*x+.59)+.14),0.,1.);}
+void main(){
+ vec2 uc=v-.5; float ca=dot(uc,uc)*.01;
+ vec3 sc; sc.r=texture(u_scene,v+uc*ca).r; sc.g=texture(u_scene,v).g; sc.b=texture(u_scene,v-uc*ca).b;
+ vec3 b=texture(u_bloom,v).rgb;
+ vec3 c=sc+b*u_bloomI;
+ c+=vec3(1.,.96,.9)*u_flash;
+ c*=1.-smoothstep(.4,1.,length(uc)*1.4)*.5;
+ c=aces(c*u_exp);
+ c=pow(c,vec3(1./2.2));
+ c*=1.-u_fade;
+ c+=(hash(gl_FragCoord.xy+fract(u_time)*91.7)-.5)/255.;
+ o=vec4(c,1.);
+}`;
+
+/* =====================================================================
+   GL helpers
+   ===================================================================== */
+function prog(vs, fs, name) {
+  const p = gl.createProgram();
+  for (const [t, s] of [[gl.VERTEX_SHADER, vs], [gl.FRAGMENT_SHADER, fs]]) {
+    const sh = gl.createShader(t); gl.shaderSource(sh, s); gl.compileShader(sh);
+    if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS)) { const m = name + ': ' + gl.getShaderInfoLog(sh); fail(m); throw new Error(m); }
+    gl.attachShader(p, sh);
+  }
+  gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) { const m = name + ' link: ' + gl.getProgramInfoLog(p); fail(m); throw new Error(m); }
+  p.u = {}; p.name = name; return p;
+}
+const loc = (p, n) => (n in p.u) ? p.u[n] : (p.u[n] = gl.getUniformLocation(p, n));
+const u1 = (p, n, v) => gl.uniform1f(loc(p, n), v);
+const u1i = (p, n, v) => gl.uniform1i(loc(p, n), v);
+const u2 = (p, n, a, b) => gl.uniform2f(loc(p, n), a, b);
+const u3 = (p, n, v) => gl.uniform3f(loc(p, n), v[0], v[1], v[2]);
+const u4 = (p, n, a, b, c, d) => gl.uniform4f(loc(p, n), a, b, c, d);
+
+function makeRT(w, h, wrapRepeatX) {
+  const tex = gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D, tex);
+  gl.texImage2D(gl.TEXTURE_2D, 0, IFMT, w, h, 0, gl.RGBA, ITYP, null);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, wrapRepeatX ? gl.REPEAT : gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  const fb = gl.createFramebuffer(); gl.bindFramebuffer(gl.FRAMEBUFFER, fb);
+  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
+  return { tex, fb, w, h };
+}
+function freeRT(r) { if (r) { gl.deleteTexture(r.tex); gl.deleteFramebuffer(r.fb); } }
+function bindRT(r) { gl.bindFramebuffer(gl.FRAMEBUFFER, r ? r.fb : null); gl.viewport(0, 0, r ? r.w : cv.width, r ? r.h : cv.height); }
+function bindTex(unit, tex) { gl.activeTexture(gl.TEXTURE0 + unit); gl.bindTexture(gl.TEXTURE_2D, tex); }
+
+const P = {
+  neb: prog(VS_FULL, FS_NEB, 'neb'), bg: prog(VS_FULL, FS_BG, 'bg'),
+  planet: prog(VS_BODY, FS_PLANET, 'planet'), star: prog(VS_BODY, FS_STAR, 'star'), halo: prog(VS_BODY, FS_HALO, 'halo'),
+  beam: prog(VS_BODY, FS_BEAM, 'beam'), shock: prog(VS_BODY, FS_SHOCK, 'shock'),
+  trail: prog(VS_TRAIL, FS_TRAIL, 'trail'), pt: prog(VS_PT, FS_PT, 'pt'),
+  down: prog(VS_FULL, FS_DOWN, 'down'), up: prog(VS_FULL, FS_UP, 'up'), comp: prog(VS_FULL, FS_COMP, 'comp')
+};
+
+const quadVAO = gl.createVertexArray(); gl.bindVertexArray(quadVAO);
+const quadBuf = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, quadBuf);
+gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 1, -1, -1, 1, 1, 1]), gl.STATIC_DRAW);
+gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+const drawQuad = () => { gl.bindVertexArray(quadVAO); gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4); };
+
+const trailVAO = gl.createVertexArray(); gl.bindVertexArray(trailVAO);
+const trailBuf = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, trailBuf);
+gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 4, gl.FLOAT, false, 28, 0);
+gl.enableVertexAttribArray(1); gl.vertexAttribPointer(1, 3, gl.FLOAT, false, 28, 16);
+const ptVAO = gl.createVertexArray(); gl.bindVertexArray(ptVAO);
+const ptBuf = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, ptBuf);
+gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 28, 0);
+gl.enableVertexAttribArray(1); gl.vertexAttribPointer(1, 4, gl.FLOAT, false, 28, 12);
+const TRAIL_MAX = 60000, PT_MAX = 9000;
+const trailData = new Float32Array(TRAIL_MAX * 7), ptData = new Float32Array(PT_MAX * 7);
+
+/* =====================================================================
+   Simulation state (N-body: stars attract everything)
+   ===================================================================== */
+const CYC = 100, EVT = 72, STEP = 1 / 240, SPEED = 1.4;
+const NAMES = ['KEPLER', 'HD', 'GLIESE', 'TRAPPIST', 'LHS', 'WOLF', 'TYC', 'GAIA'];
+let rnd, bodies = [], stars = [], planets = [], comets = [], tail = [], ej = [];
+let A, B, SN = null, tc = 0, simT = 0, simAcc = 0, flashT = -99, sysName = '', seed = 1, last = performance.now(), frameN = 0;
+let nebRT = null, sceneRT = null, bloomRT = [], nebHue = [200, 260, 320], bandAng = .5;
+
+function build(sd) {
+  seed = sd; rnd = mb(sd * 7919 + 13); const r = rnd;
+  tc = 0; simT = 0; SN = null; ej = []; tail = []; flashT = -99; simAcc = 0; shotIdx = -1;
+  const h1 = [205, 265, 325, 15, 165][(r() * 5) | 0] + r() * 30, h2 = h1 + 60 + r() * 100, h3 = h1 + 150 + r() * 60;
+  nebHue = [h1, h2, h3]; bandAng = r() * 3.14;
+  bakeNebula(r);
+  sysName = NAMES[(r() * NAMES.length) | 0] + '-' + (1000 + ((r() * 8999) | 0));
+
+  const mA = 5.5e5 + r() * 1.5e5, mB = 2.5e5 + r() * 1.2e5, M = mA + mB, sep = 70;
+  const w = Math.sqrt(M / (sep ** 3)), ph = r() * TAU, rA = sep * mB / M, rB = sep * mA / M, c = Math.cos(ph), s = Math.sin(ph);
+  A = { type: 'star', x: rA * c, y: rA * s, vx: -w * rA * s, vy: w * rA * c, m: mA, rad: 20, col: [.65, .78, 1], lum: 1, trail: [], tl: 160, tcol: [.6, .75, 1], rem: false, ts: 0, int: 7, seed: [r() * 50, r() * 50, r() * 50] };
+  B = { type: 'star', x: -rB * c, y: -rB * s, vx: w * rB * s, vy: -w * rB * c, m: mB, rad: 13, col: [1, .68, .42], lum: .45, trail: [], tl: 160, tcol: [1, .66, .4], int: 5, seed: [r() * 50, r() * 50, r() * 50] };
+  stars = [A, B]; bodies = [A, B]; planets = []; comets = [];
+
+  const defs = [
+    { r: 270, rad: 15, kind: 0, h: 22, moons: 0 },
+    { r: 350, rad: 19, kind: 1, h: 205, moons: 1 },
+    { r: 450, rad: 14, kind: 0, h: 8, moons: 2 },
+    { r: 660, rad: 42, kind: 2, h: 34, moons: 3, ring: true },
+    { r: 880, rad: 29, kind: 3, h: 188, moons: 2 }
+  ];
+  for (const d of defs) {
+    const rr = d.r * (.97 + r() * .06), a = r() * TAU, v = Math.sqrt(M / rr) * (.96 + r() * .06);
+    const ta = d.ring ? .08 + r() * .08 : (.1 + r() * .45), tph = r() * TAU;
+    const p = {
+      type: 'planet', kind: d.kind, x: rr * Math.cos(a), y: rr * Math.sin(a), vx: -v * Math.sin(a), vy: v * Math.cos(a),
+      rad: d.rad * (.92 + r() * .16), ring: !!d.ring, heat: 0, hit: false, trail: [],
+      tl: Math.min(700, Math.floor(TAU * rr / v / .0233 * .55)), moons: [],
+      axis: [Math.sin(ta) * Math.cos(tph), Math.sin(ta) * Math.sin(tph), Math.cos(ta)],
+      spin: (.18 + r() * .2) * (r() < .85 ? 1 : -1), spinPh: r() * TAU, seed: [r() * 40 + 1, r() * 40 + 1, r() * 40 + 1]
+    };
+    const hh = d.h + r() * 24 - 12;
+    if (d.kind === 0) { p.pal = [lin(hsl(hh, .22, .42)), lin(hsl(hh + 8, .26, .66)), lin(hsl(hh - 6, .3, .22))]; p.tcol = hsl(hh, .5, .6); }
+    if (d.kind === 1) { p.pal = [[.02, .12, .3], lin(hsl(hh - 165, .35, .5)), [.05, .18, .04]]; p.tcol = [.4, .7, 1]; }
+    if (d.kind === 2) { p.pal = [lin(hsl(hh, .5, .72)), lin(hsl(hh - 12, .55, .46)), lin(hsl(hh - 22, .6, .3))]; p.tcol = hsl(hh, .5, .65); }
+    if (d.kind === 3) { p.pal = [[.15, .55, .72], [.04, .2, .5], [.55, .85, .95]]; p.tcol = [.5, .85, 1]; }
+    for (let i = 0; i < d.moons; i++) p.moons.push({
+      a: p.rad * (d.ring ? 3 : 2) * (1 + i * .55 + r() * .3), w: (1.6 + r() * 2) * (r() < .5 ? 1 : -1) / (1 + i * .6),
+      ph: r() * TAU, rad: Math.max(2.2, p.rad * (.1 + r() * .09)), seed: [r() * 40 + 1, r() * 40 + 1, r() * 40 + 1],
+      pal: [lin(hsl(30 + r() * 20, .08, .4)), lin(hsl(30, .1, .62)), lin(hsl(20, .15, .2))], inc: (r() - .5) * .5
+    });
+    planets.push(p); bodies.push(p);
+  }
+  for (let i = 0; i < 380; i++) {
+    const rr = 520 + r() * 70, a = r() * TAU, v = Math.sqrt(M / rr) * (.97 + r() * .06);
+    bodies.push({ type: 'belt', x: rr * Math.cos(a), y: rr * Math.sin(a), vx: -v * Math.sin(a), vy: v * Math.cos(a), a: .3 + r() * .5, sz: .8 + r() * 1.6, hit: false });
+  }
+  for (let i = 0; i < 3; i++) {
+    const rr = 820 + r() * 120, a = r() * TAU, v = Math.sqrt(M / rr) * (.6 + r() * .08) * (r() < .7 ? 1 : -1);
+    const cm = { type: 'comet', x: rr * Math.cos(a), y: rr * Math.sin(a), vx: -v * Math.sin(a), vy: v * Math.cos(a), hit: false, trail: [], tl: 200, tcol: [.65, .85, 1] };
+    comets.push(cm); bodies.push(cm);
+  }
+  accel();
+}
+function accel() {
+  for (const b of bodies) {
+    b.ax = 0; b.ay = 0;
+    for (const s of stars) {
+      if (s === b) continue;
+      const dx = s.x - b.x, dy = s.y - b.y, d2 = dx * dx + dy * dy + 36, inv = s.m / (d2 * Math.sqrt(d2));
+      b.ax += dx * inv; b.ay += dy * inv;
+    }
+  }
+}
+function step(h) {
+  for (const b of bodies) { b.vx += b.ax * h / 2; b.vy += b.ay * h / 2; b.x += b.vx * h; b.y += b.vy * h; }
+  accel();
+  for (const b of bodies) { b.vx += b.ax * h / 2; b.vy += b.ay * h / 2; }
+}
+function explode() {
+  SN = { x: A.x, y: A.y, t0: tc, seed: [rnd() * 30, rnd() * 30, rnd() * 30] };
+  A.rem = true; A.m *= .18; A.rad = 4; A.col = [.75, .85, 1]; A.lum = .25; A.int = 14; A.ts = 0; flashT = tc;
+  for (let i = 0; i < 2600; i++) {
+    const a = rnd() * TAU, sp = 60 + Math.sqrt(rnd()) * 380;
+    ej.push({ x: A.x, y: A.y, vx: Math.cos(a) * sp + A.vx, vy: Math.sin(a) * sp + A.vy, life: 1, k: rnd() });
+  }
+}
+function update(dt) {
+  if (!A.rem) {
+    const ts = sm(clamp((tc - 62) / 10)); A.ts = ts;
+    A.rad = 20 * (1 + 2.2 * ts * ts) * (1 + .04 * ts * Math.sin(tc * (4 + 14 * ts)));
+    A.col = mixc([.65, .78, 1], [1, .36, .2], ts); A.lum = 1 + ts * .8; A.int = mix(7, 4.5, ts);
+  }
+  for (const b of bodies) if (b.trail) {
+    b.trail.push(b.x, b.y);
+    if (b.trail.length > b.tl * 2) b.trail.splice(0, 2);
+    if (b.heat > 0) b.heat = Math.max(0, b.heat - dt * .04);
+  }
+  for (const c of comets) {
+    const dd = Math.hypot(c.x, c.y);
+    if (dd < 700 && tail.length < 3200) for (let i = 0; i < 4; i++) {
+      const sp = 28 + (700 - dd) * .14, ux = c.x / dd, uy = c.y / dd;
+      tail.push({ x: c.x + (rnd() - .5) * 3, y: c.y + (rnd() - .5) * 3, vx: ux * sp + c.vx * .15 + (rnd() - .5) * 12, vy: uy * sp + c.vy * .15 + (rnd() - .5) * 12, life: 1, dec: .4 + rnd() * .5, dust: rnd() < .35 });
+    }
+  }
+  let j = 0;
+  for (const p of tail) { p.x += p.vx * dt; p.y += p.vy * dt; p.life -= dt * p.dec; if (p.life > 0) tail[j++] = p; }
+  tail.length = j;
+  if (SN) {
+    const R = (tc - SN.t0) * 260;
+    for (const b of bodies) {
+      if (b.type === 'star' || b.hit) continue;
+      const dx = b.x - SN.x, dy = b.y - SN.y, d = Math.hypot(dx, dy) || 1;
+      if (d < R) {
+        b.hit = true;
+        const imp = 80 * (240 / (d + 180)) * (b.type === 'belt' ? .5 + rnd() : 1);
+        b.vx += dx / d * imp; b.vy += dy / d * imp;
+        if (b.type === 'planet') b.heat = 1;
+      }
+    }
+    j = 0;
+    for (const p of ej) { p.x += p.vx * dt; p.y += p.vy * dt; p.vx *= .9988; p.vy *= .9988; p.life -= dt / 20; if (p.life > 0) ej[j++] = p; }
+    ej.length = j;
+  }
+}
+
+/* =====================================================================
+   Camera director
+   ===================================================================== */
+const pos = b => ({ x: b.x, y: b.y });
+const SHOTS = [
+  { t0: 0,  tg: () => ({ x: 0, y: 0 }), zm: t => .56 + .04 * (t / 12), tilt: 40 },
+  { t0: 12, tg: () => pos(planets[1]), zm: () => 190 / planets[1].rad, tilt: 32 },
+  { t0: 24, tg: () => pos(planets[3]), zm: () => 132 / planets[3].rad, tilt: 36 },
+  { t0: 36, tg: () => ({ x: (A.x + B.x) / 2, y: (A.y + B.y) / 2 }), zm: () => 3.8, tilt: 58 },
+  { t0: 46, tg: () => pos(planets[2]), zm: () => 170 / planets[2].rad, tilt: 35 },
+  { t0: 54, tg: () => pos(planets[4]), zm: () => 150 / planets[4].rad, tilt: 26 },
+  { t0: 62, tg: () => pos(A), zm: t => 3.2 - 1.4 * clamp(t / 10), tilt: 50 },
+  { t0: 72, tg: () => pos(A), zm: t => 1.8 - .6 * clamp(t / 6), tilt: 50, tr: 1.2 },
+  { t0: 79, tg: () => ({ x: 0, y: 0 }), zm: t => .34 - .04 * clamp(t / 20), tilt: 48, tr: 5 }
+];
+let shotIdx = -1;
+const cam = { x: 0, y: 0, lz: Math.log(.56), tilt: 40, az: .15 };
+let prevCam = { x: 0, y: 0, lz: cam.lz, tilt: 40 };
+function updateCam() {
+  let i = SHOTS.length - 1; while (SHOTS[i].t0 > tc) i--;
+  if (i !== shotIdx) { shotIdx = i; prevCam = { x: cam.x, y: cam.y, lz: cam.lz, tilt: cam.tilt }; }
+  const sh = SHOTS[i], t = tc - sh.t0, s = sm(clamp(t / (sh.tr || 3)));
+  const tp = sh.tg();
+  cam.x = mix(prevCam.x, tp.x, s); cam.y = mix(prevCam.y, tp.y, s);
+  cam.lz = mix(prevCam.lz, Math.log(sh.zm(t)), s); cam.tilt = mix(prevCam.tilt, sh.tilt, s);
+  cam.az = .15 + tc * .015;
+}
+
+/* view transform */
+let W = 1, H = 1, unit = 1, VT = {};
+function setView() {
+  const az = cam.az, t = cam.tilt * Math.PI / 180;
+  const shake = SN ? Math.exp(-(tc - SN.t0) * 1.4) * (tc - SN.t0 < 5 ? 1 : 0) : 0;
+  VT = { cs: Math.cos(az), sn: Math.sin(az), st: Math.sin(t), ct: Math.cos(t), k: Math.exp(cam.lz) * H / 1000,
+    ox: (Math.random() - .5) * 14 * shake * unit, oy: (Math.random() - .5) * 14 * shake * unit };
+}
+function proj(x, y) {   // world -> [sx, sy (y up), zv]
+  const dx = x - cam.x, dy = y - cam.y, X = dx * VT.cs - dy * VT.sn, Y = dx * VT.sn + dy * VT.cs;
+  return [W / 2 + X * VT.k + VT.ox, H / 2 + Y * VT.st * VT.k + VT.oy, -Y * VT.ct];
+}
+function tv(ax, ay, az) {   // world vector -> view vector
+  const X = ax * VT.cs - ay * VT.sn, Y = ax * VT.sn + ay * VT.cs;
+  return [X, Y * VT.st + az * VT.ct, -Y * VT.ct + az * VT.st];
+}
+const norm3 = v => { const l = Math.hypot(v[0], v[1], v[2]) || 1; return [v[0] / l, v[1] / l, v[2] / l]; };
+const cross = (a, b) => [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
+
+function lightsFor(x, y) {
+  const L = new Float32Array(6), C = new Float32Array(6);
+  stars.forEach((s, i) => {
+    const dx = s.x - x, dy = s.y - y, d = Math.hypot(dx, dy) + 1;
+    const l = norm3(tv(dx, dy, 0));
+    const I = Math.min(2.6, s.lum * .85 * Math.pow(520 / d, 2));
+    L.set(l, i * 3); C.set([s.col[0] * I, s.col[1] * I, s.col[2] * I], i * 3);
+  });
+  return { L, C };
+}
+function frameFor(axis, theta) {
+  const a = norm3(axis);
+  const e1 = norm3(cross(a, [1, 0, 0])), e2 = cross(a, e1);
+  const c = Math.cos(theta), s = Math.sin(theta);
+  const lx = [c * e1[0] + s * e2[0], c * e1[1] + s * e2[1], c * e1[2] + s * e2[2]];
+  const lz = cross(lx, a);
+  const lxv = tv(...lx), av = tv(...a), lzv = tv(...lz);
+  return { m: new Float32Array([lxv[0], av[0], lzv[0], lxv[1], av[1], lzv[1], lxv[2], av[2], lzv[2]]), axisV: av };
+}
+
+/* =====================================================================
+   Rendering
+   ===================================================================== */
+function bakeNebula(r) {
+  if (!nebRT) nebRT = makeRT(2048, 1024, true);
+  bindRT(nebRT); gl.disable(gl.BLEND); gl.useProgram(P.neb);
+  const c = hh => lin(hsl(hh, .8, .5));
+  u3(P.neb, 'u_h1', c(nebHue[0])); u3(P.neb, 'u_h2', c(nebHue[1])); u3(P.neb, 'u_h3', c(nebHue[2]));
+  u1(P.neb, 'u_seed', r() * 100); drawQuad();
+}
+
+let LV = 0; const LEVELS = [3840, 2880, 1920, 1440];
+function resize() {
+  const aspect = innerWidth / innerHeight;
+  W = cv.width = LEVELS[LV]; H = cv.height = Math.round(LEVELS[LV] / aspect); unit = H / 1080;
+  freeRT(sceneRT); bloomRT.forEach(freeRT); bloomRT = [];
+  sceneRT = makeRT(W, H);
+  let w = W >> 1, h = H >> 1;
+  for (let i = 0; i < 6; i++) { bloomRT.push(makeRT(Math.max(2, w), Math.max(2, h))); w >>= 1; h >>= 1; }
+}
+
+function bodyQuad(prog, sx, sy, radPx, ext) {
+  u2(prog, 'u_res', W, H); u2(prog, 'u_c', sx, sy); u1(prog, 'u_ext', ext); u1(prog, 'u_rad', radPx); drawQuad();
+}
+function onScreen(sx, sy, r) { return sx + r > 0 && sx - r < W && sy + r > 0 && sy - r < H; }
+
+function drawPlanetLike(o) {   // o: {x,y,rad,kind,pal,seed,axis,theta,ring,heat,cloud, sx,sy}
+  const rad = o.rad * VT.k; if (!onScreen(o.sx, o.sy, rad * (o.ring ? 2.8 : 1.5))) return;
+  if (rad < 1.2 * unit) {
+    ptData.set([o.sx, o.sy, 3 * unit, ...(o.pal[0]), 1.2], 0);
+    gl.blendFunc(gl.ONE, gl.ONE); gl.useProgram(P.pt); u2(P.pt, 'u_res', W, H); gl.bindVertexArray(ptVAO); gl.bindBuffer(gl.ARRAY_BUFFER, ptBuf);
+    gl.bufferData(gl.ARRAY_BUFFER, ptData.subarray(0, 7), gl.DYNAMIC_DRAW); gl.drawArrays(gl.POINTS, 0, 1);
+    gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA); return;
+  }
+  const f = frameFor(o.axis, o.theta), li = lightsFor(o.x, o.y), p = P.planet;
+  gl.useProgram(p);
+  u1i(p, 'u_kind', o.kind); u3(p, 'u_seed', o.seed); u3(p, 'u_c1', o.pal[0]); u3(p, 'u_c2', o.pal[1]); u3(p, 'u_c3', o.pal[2]);
+  u3(p, 'u_axis', f.axisV); gl.uniformMatrix3fv(loc(p, 'u_rotT'), false, f.m);
+  gl.uniform3fv(loc(p, 'u_L[0]'), li.L); gl.uniform3fv(loc(p, 'u_C[0]'), li.C);
+  u1(p, 'u_ring', o.ring ? 2.35 : 0); u1(p, 'u_ringIn', 1.45); u1(p, 'u_time', tc); u1(p, 'u_heat', o.heat || 0); u1(p, 'u_cloud', o.cloud || 0);
+  bodyQuad(p, o.sx, o.sy, rad, o.ring ? 2.6 : 1.45);
+}
+
+function render() {
+  setView();
+  const gB = gl;
+  gl.disable(gl.DEPTH_TEST); gl.disable(gl.CULL_FACE);
+  /* --- scene HDR --- */
+  bindRT(sceneRT); gl.disable(gl.BLEND);
+  gl.useProgram(P.bg); bindTex(0, nebRT.tex); u1i(P.bg, 'u_neb', 0);
+  u2(P.bg, 'u_res', W, H); u2(P.bg, 'u_off', cam.az * H * 1.3 + cam.x * .02, cam.az * H * .4 + cam.y * .02);
+  u4(P.bg, 'u_sky', .25 + cam.az * .06, .5 + Math.sin(tc * .01) * .06, 3.2, cam.az * .5);
+  u1(P.bg, 'u_time', tc); u1(P.bg, 'u_unit', unit); u1(P.bg, 'u_nebI', 1 + (flashT > 0 ? Math.exp(-(tc - flashT) * .5) * .6 : 0)); u1(P.bg, 'u_band', bandAng);
+  drawQuad();
+
+  gl.enable(gl.BLEND);
+  const items = [];
+  const sp = stars.map(s => proj(s.x, s.y));
+
+  /* star halos (additive) */
+  gl.blendFunc(gl.ONE, gl.ONE);
+  stars.forEach((s, i) => {
+    const rad = s.rad * VT.k, ext = s.rem ? 20 : 17; if (!onScreen(sp[i][0], sp[i][1], rad * ext)) return;
+    gl.useProgram(P.halo); u3(P.halo, 'u_col', s.col); u3(P.halo, 'u_seed', s.seed); u1(P.halo, 'u_int', s.int * (s.rem ? .8 : 1));
+    u1(P.halo, 'u_time', tc); u1(P.halo, 'u_ext', ext); bodyQuad(P.halo, sp[i][0], sp[i][1], Math.max(rad, 2 * unit), ext);
+  });
+
+  /* trails */
+  const zf = clamp(1.15 - .22 * Math.log2(Math.exp(cam.lz) / .6), .12, 1);
+  let tn = 0; const ranges = [];
+  for (const b of bodies) {
+    if (!b.trail) continue;
+    const n = b.trail.length / 2; if (n < 3) continue;
+    const base = (b.type === 'star' ? .28 : b.type === 'comet' ? .32 : .26) * zf, wd = 1.5 * unit;
+    const start = tn; let px = 0, py = 0;
+    for (let i = 0; i < n; i++) {
+      const q = proj(b.trail[i * 2], b.trail[i * 2 + 1]);
+      let nx = 0, ny = 1;
+      if (i < n - 1) { const q2 = proj(b.trail[i * 2 + 2], b.trail[i * 2 + 3]); const dx = q2[0] - q[0], dy = q2[1] - q[1], l = Math.hypot(dx, dy) || 1; nx = -dy / l; ny = dx / l; px = nx; py = ny; } else { nx = px; ny = py; }
+      const al = Math.pow(i / n, 2) * base, c = b.tcol;
+      for (const e of [-1, 1]) { trailData.set([q[0] + nx * wd * e, q[1] + ny * wd * e, e, al, c[0], c[1], c[2]], tn * 7); tn++; if (tn >= TRAIL_MAX - 2) break; }
+      if (tn >= TRAIL_MAX - 2) break;
+    }
+    ranges.push([start, tn - start]);
+  }
+  gl.useProgram(P.trail); u2(P.trail, 'u_res', W, H); gl.bindVertexArray(trailVAO); gl.bindBuffer(gl.ARRAY_BUFFER, trailBuf);
+  gl.bufferData(gl.ARRAY_BUFFER, trailData.subarray(0, tn * 7), gl.DYNAMIC_DRAW);
+  for (const [s0, c0] of ranges) gl.drawArrays(gl.TRIANGLE_STRIP, s0, c0);
+
+  /* points: belt, tails, ejecta, comet comae */
+  let pn = 0;
+  const addPt = (x, y, size, r, g, b, a) => { if (pn >= PT_MAX) return; ptData[pn * 7] = x; ptData[pn * 7 + 1] = y; ptData[pn * 7 + 2] = size; ptData[pn * 7 + 3] = r; ptData[pn * 7 + 4] = g; ptData[pn * 7 + 5] = b; ptData[pn * 7 + 6] = a; pn++; };
+  const zs = Math.min(3, Math.sqrt(Math.exp(cam.lz) / .6));
+  for (const b of bodies) if (b.type === 'belt') {
+    const q = proj(b.x, b.y); if (q[0] < 0 || q[0] > W || q[1] < 0 || q[1] > H) continue;
+    const hot = b.hit; addPt(q[0], q[1], Math.max(2.4, b.sz * 2.4 * unit * zs), hot ? 1 : .75, hot ? .55 : .66, hot ? .35 : .58, b.a * (hot ? 1.1 : .8));
+  }
+  for (const p of tail) {
+    const q = proj(p.x, p.y); if (q[0] < 0 || q[0] > W || q[1] < 0 || q[1] > H) continue;
+    if (p.dust) addPt(q[0], q[1], (3 + p.life * 6) * unit * zs, 1, .85, .65, p.life * .22);
+    else addPt(q[0], q[1], (2.5 + p.life * 5) * unit * zs, .5, .78, 1, p.life * .35);
+  }
+  for (const c of comets) {
+    const q = proj(c.x, c.y); if (!onScreen(q[0], q[1], 80)) continue;
+    const dd = Math.hypot(c.x, c.y), act = clamp((760 - dd) / 400);
+    addPt(q[0], q[1], (16 + 40 * act) * unit * zs, .55, .85, 1, .5 * (.3 + act));
+    addPt(q[0], q[1], 5 * unit * zs, 1, 1, 1, 3);
+  }
+  if (SN) for (const p of ej) {
+    const q = proj(p.x, p.y); if (q[0] < 0 || q[0] > W || q[1] < 0 || q[1] > H) continue;
+    const c = mixc([.55, .75, 1], [1, .55, .28], clamp(p.life * 1.2 - p.k * .2));
+    addPt(q[0], q[1], (2 + p.life * 3) * unit * zs, c[0], c[1], c[2], Math.pow(p.life, 1.5) * .8);
+  }
+  gl.useProgram(P.pt); u2(P.pt, 'u_res', W, H);
+  gl.bindVertexArray(ptVAO); gl.bindBuffer(gl.ARRAY_BUFFER, ptBuf);
+  gl.bufferData(gl.ARRAY_BUFFER, ptData.subarray(0, pn * 7), gl.DYNAMIC_DRAW); gl.drawArrays(gl.POINTS, 0, pn);
+
+  /* depth-sorted opaque-ish bodies */
+  gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
+  for (const p of planets) {
+    const q = proj(p.x, p.y);
+    const th = p.spinPh + p.spin * simT;
+    items.push({ z: q[2], f: () => drawPlanetLike({ x: p.x, y: p.y, sx: q[0], sy: q[1], rad: p.rad, kind: p.kind, pal: p.pal, seed: p.seed, axis: p.axis, theta: th, ring: p.ring, heat: p.heat, cloud: simT * .012 }) });
+    for (const m of p.moons) {
+      const a = m.ph + m.w * simT, mx = p.x + Math.cos(a) * m.a, my = p.y + Math.sin(a) * m.a * Math.cos(m.inc), mz = Math.sin(a) * m.a * Math.sin(m.inc);
+      const mq = proj(mx, my); mq[1] += mz * VT.ct * VT.k; mq[2] += mz * VT.st;
+      items.push({ z: mq[2], f: () => drawPlanetLike({ x: mx, y: my, sx: mq[0], sy: mq[1], rad: m.rad, kind: 0, pal: m.pal, seed: m.seed, axis: [0, 0.2, 1], theta: simT * .05, ring: false, heat: p.heat * .6, cloud: 0 }) });
+    }
+  }
+  stars.forEach((s, i) => items.push({ z: sp[i][2], f: () => {
+    const rad = s.rad * VT.k; if (!onScreen(sp[i][0], sp[i][1], rad * 1.5)) return;
+    gl.useProgram(P.star); u3(P.star, 'u_col', s.col); u3(P.star, 'u_seed', s.seed); u1(P.star, 'u_int', s.int); u1(P.star, 'u_time', tc); u1(P.star, 'u_swell', s === A ? A.ts : 0);
+    bodyQuad(P.star, sp[i][0], sp[i][1], Math.max(rad, 1.5 * unit), 1.05);
+  } }));
+  items.sort((a, b) => a.z - b.z);
+  for (const it of items) it.f();
+
+  /* additive effects: pulsar beams + shockwave */
+  gl.blendFunc(gl.ONE, gl.ONE);
+  if (A.rem) {
+    const q = sp[0], rad = Math.max(A.rad * VT.k, 3 * unit);
+    gl.useProgram(P.beam); u1(P.beam, 'u_ang', tc * 9); u1(P.beam, 'u_int', (3.2 + Math.sin(tc * 31) * .6)); u3(P.beam, 'u_col', [.55, .75, 1]);
+    bodyQuad(P.beam, q[0], q[1], rad * 3 + 14 * unit, 14);
+  }
+  if (SN) {
+    const el = tc - SN.t0, R = el * 260 * VT.k, q = proj(SN.x, SN.y), fade = clamp(1 - el / 22);
+    if (R > 2 * unit && fade > 0) {
+      gl.useProgram(P.shock); u1(P.shock, 'u_fade', fade); u1(P.shock, 'u_time', tc); u3(P.shock, 'u_seed', SN.seed);
+      bodyQuad(P.shock, q[0], q[1], R, 1.12);
+    }
+  }
+  gl.disable(gl.BLEND);
+
+  /* --- bloom --- */
+  gl.useProgram(P.down); u1i(P.down, 'u_t', 0);
+  let src = sceneRT;
+  for (let i = 0; i < bloomRT.length; i++) {
+    bindRT(bloomRT[i]); bindTex(0, src.tex); u2(P.down, 'u_texel', 1 / src.w, 1 / src.h); u1i(P.down, 'u_first', i === 0 ? 1 : 0); drawQuad(); src = bloomRT[i];
+  }
+  gl.enable(gl.BLEND); gl.blendFunc(gl.ONE, gl.ONE);
+  gl.useProgram(P.up); u1i(P.up, 'u_t', 0);
+  for (let i = bloomRT.length - 1; i > 0; i--) {
+    bindRT(bloomRT[i - 1]); bindTex(0, bloomRT[i].tex); u2(P.up, 'u_texel', 1 / bloomRT[i].w, 1 / bloomRT[i].h); u1(P.up, 'u_w', .85); drawQuad();
+  }
+  gl.disable(gl.BLEND);
+
+  /* --- composite to screen --- */
+  bindRT(null); gl.useProgram(P.comp);
+  bindTex(0, sceneRT.tex); u1i(P.comp, 'u_scene', 0); bindTex(1, bloomRT[0].tex); u1i(P.comp, 'u_bloom', 1);
+  const tf = tc - flashT; let flash = 0;
+  if (tf >= 0 && tf < 6) flash = (tf < .15 ? tf / .15 : Math.exp(-(tf - .15) * 2.2)) * 2.6;
+  const fa = tc < 3 ? 1 - tc / 3 : tc > CYC - 4 ? (tc - (CYC - 4)) / 4 : 0;
+  u1(P.comp, 'u_bloomI', .55); u1(P.comp, 'u_fade', clamp(fa)); u1(P.comp, 'u_flash', flash); u1(P.comp, 'u_time', tc); u1(P.comp, 'u_exp', .92);
+  drawQuad();
+}
+
+/* =====================================================================
+   Loop
+   ===================================================================== */
+let fpsEMA = 16.7, lowCnt = 0, highCnt = 0, hudOn = true;
+function updateHud() {
+  const st = tc < 3 ? 'Acquiring signal' : tc < 62 ? 'Orbits stable' : tc < EVT ? 'Primary core unstable — expansion detected'
+    : tc < EVT + 2 ? 'Core collapse' : tc < 90 ? 'Supernova — system unbinding' : 'Signal lost';
+  hud.innerHTML = `<b>${sysName}</b>  ·  circumbinary system\nepoch  T+${(tc * .43 + (seed * 37) % 90).toFixed(1)} myr\nstatus  ${st}\nrender  ${W}×${H}  ·  ${(1000 / fpsEMA).toFixed(0)} fps`;
+}
+function frame(now) {
+  requestAnimationFrame(frame);
+  const rdt = now - last; last = now;
+  const dt = clamp(rdt / 1000, 0, .05);
+  fpsEMA = fpsEMA * .95 + Math.min(rdt, 200) * .05;
+  tc += dt;
+  if (tc >= CYC) build(seed + 1);
+  if (!SN && tc >= EVT) explode();
+  simAcc += dt * SPEED; let n = 0;
+  while (simAcc >= STEP && n < 20) { step(STEP); simAcc -= STEP; simT += STEP; n++; }
+  if (n >= 20) simAcc = 0;
+  update(dt); updateCam(); render();
+  if (++frameN % 10 === 0) updateHud();
+  if (frameN > 120) {   // adaptive resolution
+    if (fpsEMA > 34) { if (++lowCnt > 90 && LV < LEVELS.length - 1) { LV++; resize(); lowCnt = 0; fpsEMA = 16.7; } } else lowCnt = 0;
+    if (fpsEMA < 19) { if (++highCnt > 900 && LV > 0 && !lockQ) { LV--; resize(); highCnt = 0; } } else highCnt = 0;
+  }
+}
+let lockQ = false;
+addEventListener('resize', resize);
+addEventListener('keydown', e => {
+  if (e.key === 'f') document.fullscreenElement ? document.exitFullscreen() : document.documentElement.requestFullscreen();
+  if (e.key === 'e' && !SN) tc = Math.max(tc, EVT - 8);
+  if (e.key === 'n') build(seed + 1);
+  if ('1234'.includes(e.key) && e.key.length === 1) { LV = +e.key - 1; lockQ = true; resize(); }
+  if (e.key === 'h') { hudOn = !hudOn; hud.style.opacity = hudOn ? .55 : 0; }
+  if (e.key === ']') tc = Math.min(CYC - 5, tc + 10);
+  if (e.key === '[') tc = Math.max(0, tc - 10);
+});
+addEventListener('click', () => { if (!document.fullscreenElement) document.documentElement.requestFullscreen().catch(() => {}); });
+
+resize(); build(1 + ((Math.random() * 9000) | 0)); requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
